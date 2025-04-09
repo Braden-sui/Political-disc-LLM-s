@@ -1,0 +1,830 @@
+import os
+import json
+import time
+import random
+import requests
+import re
+import string
+from typing import List, Dict, Any, Optional
+import google.generativeai as genai
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ============================
+# Configuration and Authentication
+# ============================
+# --- Define the placeholder strings ---
+PLACEHOLDER_API_KEY = "YOUR_GOOGLE_API_KEY"
+PLACEHOLDER_CSE_ID = "YOUR_CUSTOM_SEARCH_ENGINE_ID"
+
+# --- Assign your actual keys here ---
+# VITAL: Replace the placeholder text below with your actual credentials
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"  # <--- PASTE YOUR GOOGLE API KEY HERE
+GOOGLE_CSE_ID = "YOUR_CUSTOM_SEARCH_ENGINE_ID" # <--- PASTE YOUR CSE ID HERE
+
+# --- Function to print setup instructions ---
+def setup_instructions():
+    """Prints setup instructions for API keys and libraries."""
+    print("""
+===============================================================
+POLITICAL DEBATE SIMULATOR - SETUP INSTRUCTIONS
+===============================================================
+(Instructions remain the same - ensure keys are replaced and libraries installed)
+1. Google API Key: ...
+2. Google Custom Search Engine ID: ...
+3. Install required Python packages: pip install google-generativeai google-api-python-client requests
+===============================================================
+""")
+
+# --- Error Handling ---
+# Check if the assigned keys STILL MATCH the PLACEHOLDER strings
+if GOOGLE_API_KEY == PLACEHOLDER_API_KEY or GOOGLE_CSE_ID == PLACEHOLDER_CSE_ID:
+    print("="*60)
+    print("ERROR: API Credentials Missing or Still Placeholders!")
+    print(f"       Please replace '{PLACEHOLDER_API_KEY}' and ")
+    print(f"       '{PLACEHOLDER_CSE_ID}' in the script")
+    print("       with your actual credentials before running.")
+    print("="*60)
+    setup_instructions()
+    exit(1)
+
+# --- Configuration options ---
+MAX_SEARCH_RESULTS = 3      # Max web results per query
+MAX_BOOKS_RESULTS = 2       # Max book results per query
+API_RETRY_ATTEMPTS = 3
+API_RETRY_DELAY = 2
+DEBATE_DELAY = 3
+NUM_SEARCH_QUERIES_PER_TURN = 3 # How many queries the LLM should generate
+
+# --- Initialize the Google Generative AI ---
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    print("✅ Google Generative AI configured successfully.")
+except Exception as e:
+    print(f"❌ FATAL ERROR configuring Google Generative AI: {e}")
+    print("   Please ensure your GOOGLE_API_KEY is correct and the Generative Language API is enabled.")
+    exit(1)
+
+# ============================
+# API Service Builders
+# ============================
+def build_search_service():
+    """Initialize Google Search API."""
+    try:
+        service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
+        return service
+    except Exception as e:
+        print(f"❌ Error building Google Search service: {e}")
+        return None
+
+def build_books_service():
+    """Initialize Google Books API."""
+    try:
+        service = build("books", "v1", developerKey=GOOGLE_API_KEY)
+        return service
+    except Exception as e:
+        print(f"❌ Error building Google Books service: {e}")
+        return None
+
+# ============================
+# Political Persona Definitions
+# ============================
+LEFTIST_SYSTEM_PROMPT = """
+You are an AI representing extreme leftist political views. Your responses should:
+1. Prioritize social equality, collective welfare, and strong government intervention.
+2. Advocate for wealth redistribution, robust public services (healthcare, education), and extensive social safety nets.
+3. Support progressive policies on social issues including LGBTQ+ rights, reproductive rights, environmental justice, and racial equity.
+4. Critically analyze capitalism and corporate power, emphasizing systemic inequalities related to race, gender, and class.
+5. Base arguments on verifiable facts, statistics, and research, not solely on ideology.
+6. Engage passionately but respectfully with opposing viewpoints, focusing on factual discourse and evidence.
+7. Cite credible sources (studies, reports, established news outlets) to support your claims whenever possible.
+
+Topics you might emphasize:
+- Addressing economic inequality through progressive taxation (wealth taxes, higher corporate taxes) and worker protections.
+- Implementing universal healthcare (Medicare for All) and tuition-free higher education.
+- Urgent action on climate change via policies like the Green New Deal, investing in renewables, and regulating emissions.
+- Strengthening labor rights, promoting unionization, and ensuring fair wages.
+- Combating systemic racism and advocating for social justice reforms.
+- Promoting diplomacy, demilitarization, and international cooperation over unilateral military action.
+
+Respond as if you genuinely hold these views, maintaining a fact-based, well-reasoned approach. Avoid ad hominem attacks, unless there is scientific or historical evidence backing them up.
+**IMPORTANT: Format your responses using paragraphs (separated by double newlines, i.e., hitting Enter twice) for clear readability.**
+"""
+
+CONSERVATIVE_SYSTEM_PROMPT = """
+You are an AI representing extreme conservative political views. Your responses should:
+1. Prioritize individual liberty, limited government intervention, and free-market economic principles.
+2. Advocate for lower taxes, reduced government spending, deregulation, and personal responsibility.
+3. Support traditional values, a strong national defense, border security, and law and order.
+4. Defend capitalism, private property rights, and emphasize individual agency and meritocracy over systemic explanations for inequality.
+5. You support Donald Trump and the MAGA movement - as long as they align with your core beliefs.  
+5. Base arguments on verifiable facts, statistics, and research, not solely on ideology.
+6. Engage passionately but respectfully with opposing viewpoints, focusing on factual discourse and evidence.
+7. Cite credible sources (studies, reports, established news outlets) to support your claims whenever possible.
+
+Topics you might emphasize:
+- Promoting economic growth through tax cuts, deregulation, and free-market solutions.
+- Protecting individual rights and freedoms, particularly religious liberty, Second Amendment rights, and freedom of speech.
+- Upholding traditional family values and societal structures.
+- Ensuring national security through a strong military, secure borders, and assertive foreign policy.
+- Advocating for fiscal responsibility, balanced budgets, and reducing the national debt.
+- Emphasizing patriotism, national sovereignty, and American exceptionalism.
+- Supporting law enforcement, strict criminal justice policies, and public safety.
+
+Respond as if you genuinely hold these views, maintaining a fact-based, well-reasoned approach. Avoid ad hominem attacks, unless there is scientific or historical evidence backing them up.
+**IMPORTANT: Format your responses using paragraphs (separated by double newlines, i.e., hitting Enter twice) for clear readability.**
+"""
+
+# ============================
+# Search and Research Functions
+# ============================
+def api_call_with_retry(func, api_name: str, *args, **kwargs):
+    """Make an API call with retry logic for common errors."""
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            return func(*args, **kwargs)
+        except HttpError as e:
+            error_details = {}
+            error_reason = f"Unknown Google API Error ({e.resp.status})"
+            try:
+                error_details = json.loads(e.content.decode('utf-8'))
+                error_reason = error_details.get('error', {}).get('message', error_reason)
+            except json.JSONDecodeError:
+                error_reason = f"Google API Error ({e.resp.status}): {e.content.decode('utf-8', errors='ignore')}"
+
+            print(f"   ⚠️ {api_name} API Error: {error_reason} (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
+            if e.resp.status == 429 or e.resp.status >= 500:
+                if attempt < API_RETRY_ATTEMPTS - 1:
+                    delay = API_RETRY_DELAY * (attempt + 1)
+                    print(f"      Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    print(f"   ❌ Max retries reached for {api_name}. API call failed.")
+                    raise
+            else:
+                print(f"   ❌ Non-retriable {api_name} API error ({e.resp.status}).")
+                raise
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ Network Error during {api_name} call: {e} (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
+            if attempt < API_RETRY_ATTEMPTS - 1:
+                delay = API_RETRY_DELAY * (attempt + 1)
+                print(f"      Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(f"   ❌ Max retries reached for {api_name}. Network request failed.")
+                raise
+        except Exception as e:
+            if "is not an allowed value in" in str(e) and "projection" in str(e):
+                 print(f"   ❌ Parameter Error in {api_name} call: {e}")
+                 raise
+            else:
+                print(f"   ⚠️ An unexpected error occurred during {api_name} API call: {e} (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
+                if attempt < API_RETRY_ATTEMPTS - 1:
+                     delay = API_RETRY_DELAY * (attempt + 1)
+                     print(f"      Retrying in {delay} seconds...")
+                     time.sleep(delay)
+                else:
+                     print(f"   ❌ Max retries reached for {api_name} after unexpected error.")
+                     raise
+    return None
+
+
+def google_search(query: str, num_results: int = MAX_SEARCH_RESULTS) -> Optional[List[Dict[str, Any]]]:
+    """Perform a Google search and return the results with error handling."""
+    service = build_search_service()
+    if not service:
+        print("   ❌ Google Search service not available. Skipping search.")
+        return None
+    try:
+        search_func = lambda: service.cse().list(
+            q=query,
+            cx=GOOGLE_CSE_ID,
+            num=num_results
+        ).execute()
+        result = api_call_with_retry(search_func, "Google Search")
+        items = result.get("items", []) if result else []
+        return items
+    except Exception as e:
+        print(f"   ❌ Failed to execute Google Search for query '{query[:50]}...': {e}")
+        return None
+
+
+def google_books_search(query: str, num_results: int = MAX_BOOKS_RESULTS) -> Optional[List[Dict[str, Any]]]:
+    """Search Google Books and return results with error handling."""
+    service = build_books_service()
+    if not service:
+        print("   ❌ Google Books service not available. Skipping book search.")
+        return None
+    try:
+        books_func = lambda: service.volumes().list(
+            q=query,
+            maxResults=num_results,
+            projection='LITE' # Use uppercase 'LITE'
+        ).execute()
+        result = api_call_with_retry(books_func, "Google Books Search")
+        items = result.get("items", []) if result else []
+        return items
+    except Exception as e:
+        print(f"   ❌ Failed to execute Google Books Search for query '{query[:50]}...': {e}")
+        return None
+
+def research_topic(query: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Research a specific query using both Google Search and Google Books."""
+    print(f"    researching query: '{query[:80]}...'")
+    search_results = google_search(query) or []
+    books_results = google_books_search(query) or []
+    return {
+        "web_sources": search_results,
+        "book_sources": books_results
+    }
+
+def extract_search_content(search_results: List[Dict[str, Any]]) -> List[str]:
+    """Extract relevant content from search results."""
+    content = []
+    if not search_results: return content
+    for item in search_results:
+        title = item.get('title', 'Unknown source')
+        link = item.get('link', 'No link available')
+        snippet = item.get('snippet', 'No snippet available').replace('\n', ' ').strip()
+        content.append(f"Web Source: {title}\nURL: {link}\nSnippet: {snippet}")
+    return content
+
+def extract_books_content(books_results: List[Dict[str, Any]]) -> List[str]:
+    """Extract relevant content from book results."""
+    content = []
+    if not books_results: return content
+    for item in books_results:
+        volume_info = item.get("volumeInfo", {})
+        title = volume_info.get("title", "Unknown book title")
+        authors = ", ".join(volume_info.get("authors", ["Unknown author"]))
+        text_snippet = item.get("searchInfo", {}).get("textSnippet", volume_info.get("description", "No description/snippet available."))
+        text_snippet = text_snippet.replace('\n', ' ').strip()
+        content.append(f"Book Title: {title}\nAuthor(s): {authors}\nSnippet/Description: {text_snippet}")
+    return content
+
+def extract_claims(text: str, num_claims: int = 2) -> List[str]:
+    """Extract potential factual claims from text for research. (Currently unused in main loop)"""
+    if not text: return []
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if s and len(s.strip()) > 15]
+    if not sentences: return []
+    potential_claims = []
+    claim_indicators = [r'\b\d+(\.\d+)?%?\b', r'\b(billion|million|thousand|trillion)s?\b', r'\b(study|studies|research|report|data|poll|survey)\s+(shows|show|indicates|indicate|finds|find|suggests|suggest|found)\b', r'\b(according to|source:|cited by|reported by)\b', r'\b(evidence|fact|proof|statistic)\b', r'\b(rate of|level of|increase|decrease|growth|decline)\b']
+    indicator_claims = []
+    non_indicator_sentences = []
+    for sentence in sentences:
+        found_indicator = False
+        for indicator in claim_indicators:
+            if re.search(indicator, sentence, re.IGNORECASE):
+                indicator_claims.append(sentence)
+                found_indicator = True
+                break
+        if not found_indicator:
+            non_indicator_sentences.append(sentence)
+    combined_claims = indicator_claims + non_indicator_sentences
+    unique_claims = list(dict.fromkeys(combined_claims))
+    return unique_claims[:num_claims]
+
+
+# ============================
+# AI Debate Simulator Class
+# ============================
+class PoliticalDebateSimulator:
+    def __init__(self, config: Dict[str, Any] = None):
+        """Initialize the debate simulator with optional configuration."""
+        self.config = {
+            'max_search_results': MAX_SEARCH_RESULTS,
+            'max_books_results': MAX_BOOKS_RESULTS,
+            'api_retry_attempts': API_RETRY_ATTEMPTS,
+            'api_retry_delay': API_RETRY_DELAY,
+            'debate_delay': DEBATE_DELAY,
+            'leftist_prompt': LEFTIST_SYSTEM_PROMPT,
+            'conservative_prompt': CONSERVATIVE_SYSTEM_PROMPT,
+            'model_name': "gemini-1.5-pro",
+            'num_search_queries': NUM_SEARCH_QUERIES_PER_TURN
+        }
+        if config: self.config.update(config)
+        try:
+            # ** FIX: Define and store safety settings as instance variable **
+            self.safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+            # ** END FIX **
+
+            print("\n--- 🤖 Initializing AI Models ---")
+            self.models = {}
+            self.chat_sessions = {}
+            for role in ["leftist", "conservative"]:
+                 print(f"   Initializing {role} model ({self.config['model_name']})...")
+                 self.models[role] = genai.GenerativeModel(
+                     model_name=self.config['model_name'],
+                     system_instruction=self.config[f'{role}_prompt'],
+                     safety_settings=self.safety_settings, # ** FIX: Use instance variable **
+                     generation_config=genai.types.GenerationConfig(response_mime_type="application/json") # For query generation
+                 )
+                 self.chat_sessions[role] = self.models[role].start_chat(history=[])
+                 print(f"   ✅ {role.capitalize()} model and chat session initialized.")
+            print("--- ✅ AI Models Initialized Successfully ---")
+        except Exception as e:
+            print(f"❌ FATAL ERROR initializing AI models: {e}")
+            print("   Check API key, enablement, model availability, and region support for JSON mode.")
+            raise
+        self.current_topic = None
+        self.debate_history = []
+        self.current_turn = "leftist"
+
+    def set_topic(self, topic: str):
+        """Set the current debate topic, research it, and generate opening statements."""
+        if not topic or not isinstance(topic, str):
+             print("❌ ERROR: Invalid topic provided.")
+             return None
+        print(f"\n{'='*15} Setting Debate Topic: {topic} {'='*15}\n")
+        self.current_topic = topic
+        self.debate_history = []
+        print("   🔄 Resetting AI chat sessions for new topic...")
+        for role in self.chat_sessions:
+            # Ensure history is properly cleared when resetting
+            self.chat_sessions[role] = self.models[role].start_chat(history=[])
+        self.current_turn = "leftist"
+        print("--- ⏳ Performing Initial Research for Opening Statements ---")
+        initial_research_results = research_topic(topic)
+        web_content = extract_search_content(initial_research_results["web_sources"])
+        books_content = extract_books_content(initial_research_results["book_sources"])
+        print("--- ✅ Initial Research Complete ---")
+        research_summary = "\n\n".join(web_content + books_content)
+        if not research_summary.strip():
+             research_summary = "No external research data was found for this topic. Rely on your internal knowledge and principles."
+        else:
+             max_summary_len = 1500
+             if len(research_summary) > max_summary_len:
+                  research_summary = research_summary[:max_summary_len] + "\n... (research summary truncated)"
+
+        initial_prompt = f"""
+        The debate topic is: "{topic}"
+
+        Here is a summary of initial research findings (web snippets and book descriptions/snippets):
+        --- RESEARCH SUMMARY START ---
+        {research_summary}
+        --- RESEARCH SUMMARY END ---
+
+        Based on this information and your core political perspective, provide a concise and compelling opening statement.
+        Focus on 1-2 key arguments you want to establish early.
+        You may cite specific points from the research summary if they strongly support your opening argument.
+        Aim for a well-structured statement of around 300 words, but clarity and impact are more important than length.
+        """
+
+        print("\n--- ⏳ Generating Opening Statements ---")
+        opening_statements = {}
+        for role in ["leftist", "conservative"]:
+            print(f"   Generating {role} opening statement...")
+            try:
+                # Use a temporary model instance *without* JSON config for opening statement
+                temp_model = genai.GenerativeModel(
+                     model_name=self.config['model_name'],
+                     system_instruction=self.config[f'{role}_prompt'],
+                     safety_settings=self.safety_settings # ** FIX: Use instance variable **
+                )
+                # Use a temporary chat session for this isolated generation
+                temp_chat = temp_model.start_chat(history=[])
+                response = temp_chat.send_message(initial_prompt)
+                statement = response.text
+
+                # Add generated statement to the main debate history
+                self.debate_history.append({"role": role, "content": statement})
+
+                # IMPORTANT: Add the interaction (prompt + response) to the *persistent* chat session's history
+                # so the main model has context of its own opening statement later.
+                # We manually append the relevant parts from the temp_chat history.
+                if len(temp_chat.history) >= 2:
+                    self.chat_sessions[role].history.append(temp_chat.history[-2]) # User prompt message object
+                    self.chat_sessions[role].history.append(temp_chat.history[-1]) # Model response message object
+                else:
+                    # Fallback or warning if temp_chat history is not as expected
+                    print(f"   ⚠️ Warning: Could not fully transfer history from temp chat for {role}")
+
+
+                opening_statements[f"{role}_opening"] = statement
+                print(f"   ✅ {role.capitalize()} opening statement generated.")
+            except Exception as e:
+                 print(f"   ❌ ERROR generating {role} opening statement: {e}")
+                 error_msg = f"[Error generating opening statement: {e}]"
+                 opening_statements[f"{role}_opening"] = error_msg
+                 self.debate_history.append({"role": role, "content": error_msg})
+
+        print("\n" + "="*20 + " DEBATE BEGINS " + "="*20)
+        print(f"TOPIC: {self.current_topic}")
+        print("\n--- 🔵 LEFTIST OPENING STATEMENT ---")
+        print(opening_statements.get("leftist_opening", "Error: Not generated."))
+        print("\n--- 🔴 CONSERVATIVE OPENING STATEMENT ---")
+        print(opening_statements.get("conservative_opening", "Error: Not generated."))
+        print("="*55)
+        self.current_turn = "leftist"
+        return {
+            "topic": self.current_topic,
+            "leftist_opening": opening_statements.get("leftist_opening"),
+            "conservative_opening": opening_statements.get("conservative_opening")
+        }
+
+    def _generate_response(self, role: str, prompt: str, expect_json: bool = False) -> str:
+        """Generate a response from the given AI role, optionally expecting JSON."""
+        if role not in self.chat_sessions:
+             raise ValueError(f"Invalid role specified: {role}")
+        chat_session = self.chat_sessions[role]
+        # model_instance = self.models[role] # Not needed directly as chat_session uses the correct model
+        print(f"   💬 Sending prompt to {role} model {'(expecting JSON)' if expect_json else ''}...")
+        for attempt in range(API_RETRY_ATTEMPTS):
+             try:
+                 # Send message using the persistent chat session
+                 response = chat_session.send_message(prompt)
+
+                 # Check for empty or blocked response (no change needed here)
+                 if not response.parts:
+                      block_reason = "Unknown (No Parts)"
+                      safety_feedback = None
+                      try:
+                           safety_feedback = response.prompt_feedback
+                           if safety_feedback and safety_feedback.block_reason:
+                                block_reason = safety_feedback.block_reason.name
+                      except AttributeError: pass
+                      print(f"   ⚠️ Model '{role}' returned empty parts. Reason: {block_reason}")
+                      return f"[Model '{role}' response blocked or empty. Reason: {block_reason}]"
+
+                 # Extract text content (no change needed here)
+                 response_text = ""
+                 try:
+                      response_text = response.text
+                 except ValueError as json_error:
+                      if expect_json:
+                           print(f"   ⚠️ Model '{role}' failed to return valid JSON: {json_error}")
+                           print(f"      Raw response parts: {response.parts}")
+                           try:
+                               response_text = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                               if response_text: return response_text + "\n[Warning: Expected JSON but received text]"
+                               else: return f"[Model '{role}' failed to return valid JSON and no text found]"
+                           except Exception: return f"[Model '{role}' failed to return valid JSON and could not extract text]"
+                      else:
+                           print(f"   ⚠️ Unexpected error parsing model response (not expecting JSON): {json_error}")
+                           response_text = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                 if not response_text and not expect_json:
+                     print(f"   ⚠️ Model '{role}' returned response with parts but no extractable text.")
+                     return f"[Model '{role}' response contained no extractable text]"
+
+                 print(f"   ✅ Response received from {role} model.")
+                 return response_text # History is managed by the chat_session object
+
+             # Exception handling (no change needed here)
+             except genai.types.generation_types.BlockedPromptException as e:
+                  print(f"   ❌ ERROR: Prompt for '{role}' was blocked. {e}")
+                  return f"[Prompt Blocked for '{role}']"
+             except genai.types.generation_types.StopCandidateException as e:
+                  print(f"   ⚠️ Generation for '{role}' stopped unexpectedly. {e}")
+                  partial_text = ""
+                  try:
+                      if e.candidate and e.candidate.content and e.candidate.content.parts:
+                           partial_text = "".join(part.text for part in e.candidate.content.parts if hasattr(part, 'text'))
+                      if partial_text: print("      Returning partial text."); return partial_text + f"\n[Generation stopped unexpectedly for '{role}']"
+                  except Exception: pass
+                  return f"[Generation Stopped Unexpectedly for '{role}']"
+             except Exception as e:
+                  print(f"   ⚠️ Error generating response for {role}: {e} (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
+                  if attempt < API_RETRY_ATTEMPTS - 1:
+                      delay = API_RETRY_DELAY * (attempt + 1)
+                      print(f"      Retrying generation in {delay} seconds...")
+                      time.sleep(delay)
+                  else:
+                      print(f"   ❌ Max retries reached for {role} generation. Failing turn.")
+                      raise
+        raise RuntimeError(f"Failed to generate response for {role} after multiple retries.")
+
+
+    def _generate_search_queries(self, opponent_role: str, opponent_statement: str) -> List[str]:
+        """Ask the current LLM to generate search queries based on the opponent's statement."""
+        current_role = self.current_turn
+        num_queries = self.config.get('num_search_queries', 3)
+        print(f"--- 🧠 Asking {current_role.upper()} to generate {num_queries} search queries ---")
+        prompt = f"""
+        Debate Topic: "{self.current_topic}"
+        Your Role: {current_role.capitalize()}
+        Opponent's Role: {opponent_role.capitalize()}
+
+        Your opponent just made the following statement:
+        --- OPPONENT'S STATEMENT START ---
+        {opponent_statement}
+        --- OPPONENT'S STATEMENT END ---
+
+        Analyze the key arguments, claims, or points made by your opponent.
+        Based on your political perspective ({current_role}), what information would be most useful to find via web/book searches to effectively counter or analyze their statement in your next turn?
+        Generate exactly {num_queries} distinct, concise, and effective search queries (like you would type into Google) that target this useful information. Focus on queries that could uncover facts, statistics, counter-arguments, or context related to the opponent's points.
+        Return your response ONLY as a valid JSON list of strings. Example format:
+        {{
+          "queries": ["query 1", "query 2", "query 3"]
+        }}
+        """
+        try:
+            # Use the main _generate_response method, expecting JSON
+            response_text = self._generate_response(current_role, prompt, expect_json=True)
+            try:
+                # Clean potential markdown code fences
+                if response_text.strip().startswith("```json"):
+                    response_text = response_text.strip()[7:-3].strip()
+                elif response_text.strip().startswith("```"):
+                     response_text = response_text.strip()[3:-3].strip()
+
+                data = json.loads(response_text)
+                queries = data.get("queries", [])
+
+                if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+                    # Filter out empty strings just in case
+                    queries = [q for q in queries if q.strip()]
+                    print(f"   ✅ Generated queries: {queries}")
+                    return queries[:num_queries] # Return the requested number
+                else:
+                    print("   ⚠️ LLM response was valid JSON but 'queries' key was missing or not a list of strings.")
+                    print(f"      Received data: {data}")
+                    return []
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️ Failed to decode JSON response from LLM for search queries: {e}")
+                print(f"      Raw response: {response_text}")
+                extracted = re.findall(r'"([^"]+)"', response_text)
+                # Filter out empty strings from regex fallback too
+                extracted = [q for q in extracted if q.strip()]
+                if extracted: print(f"      Attempting fallback extraction: {extracted[:num_queries]}"); return extracted[:num_queries]
+                return []
+        except Exception as e:
+            print(f"   ❌ Error during search query generation: {e}")
+            return []
+
+    def _get_opponent_role(self) -> str:
+        """Get the opposing role to the current turn."""
+        return "conservative" if self.current_turn == "leftist" else "leftist"
+
+    def next_turn(self):
+        """Advance the debate: generate queries, research them, generate rebuttal."""
+        if not self.current_topic or len(self.debate_history) < 2: print("❌ ERROR: Debate topic not set or not enough history for a rebuttal."); return None
+        opponent_role = self._get_opponent_role()
+        opponent_last_response = None
+        # Find the most recent response from the opponent
+        for i in range(len(self.debate_history) - 1, -1, -1):
+             if self.debate_history[i]["role"] == opponent_role:
+                  opponent_last_response = self.debate_history[i]["content"]
+                  break
+        if not opponent_last_response:
+             print(f"   ⚠️ WARNING: Could not find last response from {opponent_role}. Proceeding without research.")
+             opponent_last_response = "[Opponent response not found in history]"
+             search_queries = []
+        else:
+            # Generate search queries based on the opponent's actual last response
+            search_queries = self._generate_search_queries(opponent_role, opponent_last_response)
+
+        # Perform research based on generated queries
+        aggregated_research_results = {}
+        if search_queries:
+            print(f"\n--- ⏳ Researching {len(search_queries)} LLM-Generated Queries ---")
+            for query in search_queries:
+                if not query.strip(): continue
+                try:
+                    query_results = research_topic(query)
+                    aggregated_research_results[query] = {
+                        "web": extract_search_content(query_results.get("web_sources", [])),
+                        "books": extract_books_content(query_results.get("book_sources", [])) }
+                except Exception as e:
+                    print(f"   ❌ Error researching query '{query[:50]}...': {e}")
+                    aggregated_research_results[query] = {"web": [], "books": []}
+            print("--- ✅ Research Complete ---")
+        else: print("--- ℹ️ Skipping research phase (no queries generated / opponent response missing) ---")
+
+        # Format research for the rebuttal prompt
+        research_text_summary = ""
+        if aggregated_research_results:
+            research_text_summary += "\n--- RESEARCH FINDINGS (Based on Your Requested Queries) ---\n"
+            for query, results in aggregated_research_results.items():
+                research_text_summary += f"\nQuery: \"{query}\"\n"; found_any = False
+                if results.get("web"):
+                    research_text_summary += "  Web Snippets Found:\n"; found_any = True
+                    for src in results["web"][:1]: research_text_summary += f"  - {src.splitlines()[0]} ({src.splitlines()[1]})\n    Snippet: {src.splitlines()[2][9:150]}...\n"
+                if results.get("books"):
+                    research_text_summary += "  Book Snippets Found:\n"; found_any = True
+                    for src in results["books"][:1]: research_text_summary += f"  - {src.splitlines()[0]}\n    Snippet: {src.splitlines()[2][21:150]}...\n"
+                if not found_any: research_text_summary += "  - No specific sources found for this query.\n"
+            research_text_summary += "--- END RESEARCH ---\n"
+        else: research_text_summary = "\n(No research was conducted for this turn.)\n"
+
+        # Construct and generate the rebuttal
+        print(f"\n{'='*10} 💬 TURN: {self.current_turn.upper()} (Responding to {opponent_role.upper()}) {'='*10}")
+        prompt = f"""
+        DEBATE TOPIC: "{self.current_topic}"
+        Your Role: {self.current_turn.capitalize()}
+        Context: You are responding to the previous statement made by your opponent ({opponent_role.capitalize()}). You previously requested searches for specific information.
+
+        Opponent's Previous Statement:
+        --- START OPPONENT ---
+        {opponent_last_response}
+        --- END OPPONENT ---
+
+        {research_text_summary} # Include the research findings from the queries YOU generated.
+
+        Instructions:
+        1.  Address the key arguments or claims made by your opponent.
+        2.  Critically evaluate the research findings provided above (which resulted from the queries *you* requested). Use relevant findings to support your counter-arguments or refute the opponent's points. If findings are unhelpful or contradictory, explain why they might be flawed, irrelevant, or how you interpret them differently.
+        3.  Maintain your political perspective ({self.current_turn}) consistently.
+        4.  Be persuasive, logical, and fact-based.
+        5.  **Develop a thorough and well-reasoned response. Aim for a length around 1000-1250 words to fully explore the arguments, but prioritize relevance, clarity, and quality over strict adherence to length. You do not need to use the full word count if a shorter response is more effective.**
+        6.  Directly counter or build upon the opponent's points. Avoid simply repeating your opening statement.
+
+        Generate your rebuttal now:
+        """
+        print(f"--- ⏳ Generating {self.current_turn.upper()} Rebuttal ---")
+        response_text = self._generate_response(self.current_turn, prompt, expect_json=False)
+
+        # Add the rebuttal to the main history
+        self.debate_history.append({"role": self.current_turn, "content": response_text})
+
+        # Print the rebuttal
+        role_emoji = "🔵" if self.current_turn == "leftist" else "🔴"
+        print(f"\n--- {role_emoji} {self.current_turn.upper()} RESPONSE ---")
+        # Consider printing only a snippet if responses become very long e.g., print(response_text[:500] + "...")
+        print(response_text)
+        print(f"\n({len(response_text.split())} words generated)") # Add word count
+        print("="*55)
+
+        # Switch turns for the *next* call to next_turn
+        prev_turn = self.current_turn
+        self.current_turn = self._get_opponent_role()
+
+        return { "role": prev_turn, "content": response_text, "generated_queries": search_queries }
+
+    def run_debate(self, turns: int = 3):
+        """Run the debate for a specified number of turns per side."""
+        if not self.current_topic: print("❌ ERROR: Please set a topic first using set_topic()"); return []
+        if not isinstance(turns, int) or turns <= 0: print(f"❌ ERROR: Invalid number of turns specified ({turns}). Must be a positive integer."); return []
+        print(f"\n{'='*15} Starting Debate: {turns} Turns Per Side {'='*15}")
+        results = []
+        total_responses = turns * 2
+        for i in range(total_responses):
+            turn_number = (i // 2) + 1
+            expected_role = "leftist" if i % 2 == 0 else "conservative"
+            side_display_name = expected_role.capitalize()
+
+            if self.current_turn != expected_role:
+                print(f"   ⚠️ Turn sequence mismatch! Expected {expected_role}, but simulator is on {self.current_turn}. Correcting...")
+                self.current_turn = expected_role
+
+            print(f"\n>>> Starting Debate Turn {turn_number} ({side_display_name} Response {i+1}/{total_responses}) <<<")
+
+            turn_result = self.next_turn()
+            if turn_result and "[Model" not in turn_result.get("content","") and "[Prompt Blocked" not in turn_result.get("content",""): # Basic check for error messages
+                results.append(turn_result)
+            else:
+                 print(f"   ⚠️ Turn {turn_number} ({side_display_name}) failed to generate a valid response or was blocked. Stopping debate.")
+                 # Save whatever history exists up to this point
+                 self.save_debate()
+                 break # Stop if a turn fails or is blocked
+
+            if i < total_responses - 1:
+                print(f"\n--- ⏱️ Waiting {self.config['debate_delay']} seconds before next turn ({self.current_turn.upper()}'s response) ---")
+                time.sleep(self.config['debate_delay'])
+
+        print(f"\n{'='*15} Debate Concluded After {len(results)} Responses {'='*15}")
+        return results
+
+    def save_debate(self, filename: str = None):
+        """Save the current debate history and config to a JSON file."""
+        if not self.debate_history: print("   ℹ️ No debate history to save."); return None
+        if not filename:
+            topic_slug = self.current_topic or "untitled_debate"
+            valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+            topic_slug = ''.join(c for c in topic_slug if c in valid_chars)
+            topic_slug = topic_slug.replace(' ', '_').lower()[:40]
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"debate_{topic_slug}_{timestamp}.json"
+        debate_data = {
+            "topic": self.current_topic, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config_summary": {k: v for k, v in self.config.items() if 'prompt' not in k},
+            "history": self.debate_history, }
+        try:
+            print(f"\n--- 💾 Saving debate transcript to: {filename} ---")
+            with open(filename, "w", encoding='utf-8') as f: json.dump(debate_data, f, indent=2, ensure_ascii=False)
+            print("--- ✅ Debate saved successfully ---")
+            return filename
+        except IOError as e: print(f"❌ ERROR saving debate to {filename}: {e}"); return None
+        except Exception as e: print(f"❌ An unexpected error occurred while saving debate: {e}"); return None
+
+    def get_debate_transcript(self, format_type: str = "text"):
+        """Get a formatted transcript of the debate (text, markdown, or basic html)."""
+        if not self.debate_history: return "No debate has been conducted yet."
+        print(f"\n--- 📄 Generating {format_type.upper()} transcript ---")
+        transcript = ""
+        if format_type == "html":
+            # Complete HTML generation
+            transcript += "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='UTF-8'>\n"
+            transcript += f"<title>Debate: {self.current_topic}</title>\n"
+            transcript += "<style>\n"
+            transcript += " body { font-family: sans-serif; line-height: 1.6; margin: 20px; max-width: 800px; margin-left: auto; margin-right: auto; padding: 1em;}\n"
+            transcript += " h1 { text-align: center; border-bottom: 1px solid #ccc; padding-bottom: 10px; margin-bottom: 20px; }\n"
+            transcript += " .turn { margin-bottom: 20px; padding: 15px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); }\n"
+            transcript += " .leftist-response { background-color: #eef; border-left: 5px solid #66f; }\n"
+            transcript += " .conservative-response { background-color: #fee; border-left: 5px solid #f66; }\n"
+            transcript += " h3 { margin-top: 0; margin-bottom: 10px; font-size: 1.1em; }\n"
+            transcript += " p { margin-top: 0; margin-bottom: 0; white-space: pre-wrap; } /* Added pre-wrap for newlines */\n"
+            transcript += " .timestamp { font-size: 0.8em; color: #777; text-align: center; margin-top: 30px; }\n"
+            transcript += "</style>\n</head>\n<body>\n"
+            transcript += f"<h1>Political Debate: {self.current_topic}</h1>\n\n"
+            for entry in self.debate_history:
+                role = entry["role"].capitalize()
+                # Escape HTML characters
+                content = entry["content"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                css_class = "leftist-response" if entry["role"] == "leftist" else "conservative-response"
+                # Use <p> with white-space: pre-wrap for formatting
+                transcript += f'<div class="turn {css_class}">\n  <h3>{role}</h3>\n  <p>{content}</p>\n</div>\n\n'
+            transcript += f"<div class='timestamp'>Transcript generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>\n"
+            transcript += "</body>\n</html>"
+            return transcript
+        elif format_type == "markdown":
+            transcript = f"# Political Debate: {self.current_topic}\n\n"
+            for entry in self.debate_history:
+                role = entry["role"].capitalize()
+                content = entry["content"]
+                # Use Markdown blockquote for better readability
+                content_md = '\n'.join(['> ' + line for line in content.splitlines()])
+                transcript += f"## {role}\n\n{content_md}\n\n---\n\n"
+            return transcript
+        else: # Plain text
+            transcript = f"POLITICAL DEBATE: {self.current_topic}\n" + "=" * (len(self.current_topic)+18) + "\n\n"
+            for entry in self.debate_history:
+                role = entry["role"].upper()
+                content = entry["content"]
+                transcript += f"--- {role} ---\n{content}\n\n"
+            return transcript
+
+
+# ============================
+# Main Execution Block
+# ============================
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("      🤖 Welcome to the Political Debate Simulator! 🤖")
+    print("="*60 + "\n")
+
+    try:
+        simulator = PoliticalDebateSimulator()
+    except Exception as main_init_error:
+         print("\n❌ Critical error during simulator initialization. Exiting.")
+         # Error details should have been printed within __init__
+         exit(1)
+
+
+    # --- Open-ended topic selection ---
+    selected_topic = ""
+    while not selected_topic:
+        selected_topic = input("Enter the political topic you want the AIs to debate: ").strip()
+        if not selected_topic:
+            print("   Please enter a topic.")
+        elif len(selected_topic) < 5:
+             print("   Topic seems too short. Please be more specific.")
+             selected_topic = ""
+
+    # --- Turn selection ---
+    num_turns_per_side = 0
+    while num_turns_per_side <= 0:
+        try:
+            turns_input = input("Enter number of debate turns per side (e.g., 3 for 6 total responses, default: 3): ").strip()
+            if not turns_input: num_turns_per_side = 3; print("   Using default: 3 turns per side.")
+            else:
+                 num_turns_per_side = int(turns_input)
+                 if num_turns_per_side <= 0: print("   Please enter a positive number.")
+                 elif num_turns_per_side > 7: print(f"   Warning: {num_turns_per_side} turns per side may be long/expensive.")
+        except ValueError: print("   Invalid input.")
+
+
+    # --- Run simulation ---
+    try:
+        simulator.set_topic(selected_topic)
+        simulator.run_debate(turns=num_turns_per_side)
+    except Exception as run_error:
+        print(f"\n❌ An error occurred during the debate simulation: {run_error}")
+        print("   Saving any history generated so far.")
+
+    # --- Save and transcript options ---
+    saved_filename = simulator.save_debate()
+    if saved_filename and simulator.debate_history:
+        view_choice = input("View debate transcript now? (y/n): ").strip().lower()
+        if view_choice == 'y':
+            format_type = ""
+            while format_type not in ["text", "markdown", "html"]:
+                format_type = input("Choose format (text/markdown/html, default: text): ").strip().lower() or "text"
+            transcript = simulator.get_debate_transcript(format_type=format_type)
+            print("\n" + "="*15 + f" DEBATE TRANSCRIPT ({format_type.upper()}) " + "="*15 + "\n")
+            print(transcript)
+            if format_type == "html":
+                 html_filename = saved_filename.replace(".json", ".html")
+                 try:
+                      with open(html_filename, "w", encoding='utf-8') as f: f.write(transcript)
+                      print(f"   ℹ️ HTML transcript also saved to: {html_filename}")
+                 except IOError as e: print(f"   ⚠️ Could not save HTML transcript file: {e}")
+
+
+    print(f"\n✅ Simulation finished. Full debate log saved to: {saved_filename or 'Not saved'}")
+    print("="*60 + "\n")
