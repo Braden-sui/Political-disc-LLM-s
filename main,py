@@ -117,10 +117,10 @@ You are an AI representing extreme conservative political views. Your responses 
 2. Advocate for lower taxes, reduced government spending, deregulation, and personal responsibility.
 3. Support traditional values, a strong national defense, border security, and law and order.
 4. Defend capitalism, private property rights, and emphasize individual agency and meritocracy over systemic explanations for inequality.
-5. You support Donald Trump and the MAGA movement - as long as they align with your core beliefs.  
-5. Base arguments on verifiable facts, statistics, and research, not solely on ideology.
-6. Engage passionately but respectfully with opposing viewpoints, focusing on factual discourse and evidence.
-7. Cite credible sources (studies, reports, established news outlets) to support your claims whenever possible.
+5. You support Donald Trump and the MAGA movement - as long as they align with your core beliefs.
+6. Base arguments on verifiable facts, statistics, and research, not solely on ideology.
+7. Engage passionately but respectfully with opposing viewpoints, focusing on factual discourse and evidence.
+8. Cite credible sources (studies, reports, established news outlets) to support your claims whenever possible.
 
 Topics you might emphasize:
 - Promoting economic growth through tax cuts, deregulation, and free-market solutions.
@@ -135,9 +135,32 @@ Respond as if you genuinely hold these views, maintaining a fact-based, well-rea
 **IMPORTANT: Format your responses using paragraphs (separated by double newlines, i.e., hitting Enter twice) for clear readability.**
 """
 
+# ** NEW: Judge Persona **
+JUDGE_SYSTEM_PROMPT = """
+You are an impartial, analytical AI Judge presiding over a political debate. Your sole purpose is to evaluate the arguments presented by the Leftist and Conservative participants based on specific criteria, without personal bias or political leaning.
+
+Your evaluation criteria are:
+1.  **Logical Consistency:** Were the arguments free from internal contradictions? Did the reasoning follow logically?
+2.  **Use of Evidence (within the debate):** How effectively did each side use the research findings provided to them during the debate (if any were provided) or other factual claims to support their points? Was the evidence relevant and interpreted reasonably? (You cannot verify external facts, only evaluate how the presented information was used).
+3.  **Responsiveness & Refutation:** Did the participants directly address the points and questions raised by their opponent? How effectively did they refute counter-arguments?
+4.  **Clarity & Structure:** Was the argument presented clearly and structured logically?
+
+You will be provided with the full transcript of the debate, including opening statements, rebuttals, and closing arguments.
+
+Your task is to:
+1.  Carefully read and analyze the entire transcript.
+2.  Write a concise verdict explaining your evaluation based *only* on the criteria above.
+3.  Clearly state which side presented the stronger case *according to these criteria* and why. Highlight specific strengths and weaknesses of each side's performance during the debate.
+4.  Maintain absolute neutrality in your tone and language. Do not express personal opinions on the topic itself. Focus strictly on the quality of the debate performance.
+**Format your verdict using paragraphs for readability.**
+"""
+
 # ============================
 # Search and Research Functions
 # ============================
+# (Functions api_call_with_retry, google_search, google_books_search,
+#  research_topic, extract_search_content, extract_books_content,
+#  extract_claims remain the same)
 def api_call_with_retry(func, api_name: str, *args, **kwargs):
     """Make an API call with retry logic for common errors."""
     for attempt in range(API_RETRY_ATTEMPTS):
@@ -300,33 +323,46 @@ class PoliticalDebateSimulator:
             'debate_delay': DEBATE_DELAY,
             'leftist_prompt': LEFTIST_SYSTEM_PROMPT,
             'conservative_prompt': CONSERVATIVE_SYSTEM_PROMPT,
+            'judge_prompt': JUDGE_SYSTEM_PROMPT, # Added Judge Prompt
             'model_name': "gemini-1.5-pro",
             'num_search_queries': NUM_SEARCH_QUERIES_PER_TURN
         }
         if config: self.config.update(config)
         try:
-            # ** FIX: Define and store safety settings as instance variable **
+            # Define and store safety settings as instance variable
             self.safety_settings = [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
-            # ** END FIX **
 
             print("\n--- 🤖 Initializing AI Models ---")
             self.models = {}
             self.chat_sessions = {}
+            # Initialize Debater Models
             for role in ["leftist", "conservative"]:
                  print(f"   Initializing {role} model ({self.config['model_name']})...")
                  self.models[role] = genai.GenerativeModel(
                      model_name=self.config['model_name'],
                      system_instruction=self.config[f'{role}_prompt'],
-                     safety_settings=self.safety_settings, # ** FIX: Use instance variable **
+                     safety_settings=self.safety_settings,
                      generation_config=genai.types.GenerationConfig(response_mime_type="application/json") # For query generation
                  )
                  self.chat_sessions[role] = self.models[role].start_chat(history=[])
                  print(f"   ✅ {role.capitalize()} model and chat session initialized.")
+
+            # ** NEW: Initialize Judge Model **
+            print(f"   Initializing Judge model ({self.config['model_name']})...")
+            self.judge_model = genai.GenerativeModel(
+                 model_name=self.config['model_name'],
+                 system_instruction=self.config['judge_prompt'],
+                 safety_settings=self.safety_settings # Use same safety settings for judge
+                 # No specific generation_config needed for judge (expects text)
+            )
+            print(f"   ✅ Judge model initialized.")
+            # ** END NEW **
+
             print("--- ✅ AI Models Initialized Successfully ---")
         except Exception as e:
             print(f"❌ FATAL ERROR initializing AI models: {e}")
@@ -334,10 +370,11 @@ class PoliticalDebateSimulator:
             raise
         self.current_topic = None
         self.debate_history = []
-        self.current_turn = "leftist"
+        self.current_turn = "leftist" # Leftist still starts the main debate
 
     def set_topic(self, topic: str):
         """Set the current debate topic, research it, and generate opening statements."""
+        # (No changes needed here from previous version with formatting prompts)
         if not topic or not isinstance(topic, str):
              print("❌ ERROR: Invalid topic provided.")
              return None
@@ -346,7 +383,6 @@ class PoliticalDebateSimulator:
         self.debate_history = []
         print("   🔄 Resetting AI chat sessions for new topic...")
         for role in self.chat_sessions:
-            # Ensure history is properly cleared when resetting
             self.chat_sessions[role] = self.models[role].start_chat(history=[])
         self.current_turn = "leftist"
         print("--- ⏳ Performing Initial Research for Opening Statements ---")
@@ -374,6 +410,7 @@ class PoliticalDebateSimulator:
         Focus on 1-2 key arguments you want to establish early.
         You may cite specific points from the research summary if they strongly support your opening argument.
         Aim for a well-structured statement of around 300 words, but clarity and impact are more important than length.
+        **Please format your response using paragraphs (separated by double newlines) for readability.**
         """
 
         print("\n--- ⏳ Generating Opening Statements ---")
@@ -381,36 +418,28 @@ class PoliticalDebateSimulator:
         for role in ["leftist", "conservative"]:
             print(f"   Generating {role} opening statement...")
             try:
-                # Use a temporary model instance *without* JSON config for opening statement
                 temp_model = genai.GenerativeModel(
                      model_name=self.config['model_name'],
                      system_instruction=self.config[f'{role}_prompt'],
-                     safety_settings=self.safety_settings # ** FIX: Use instance variable **
+                     safety_settings=self.safety_settings
                 )
-                # Use a temporary chat session for this isolated generation
                 temp_chat = temp_model.start_chat(history=[])
                 response = temp_chat.send_message(initial_prompt)
                 statement = response.text
-
-                # Add generated statement to the main debate history
                 self.debate_history.append({"role": role, "content": statement})
-
-                # IMPORTANT: Add the interaction (prompt + response) to the *persistent* chat session's history
-                # so the main model has context of its own opening statement later.
-                # We manually append the relevant parts from the temp_chat history.
                 if len(temp_chat.history) >= 2:
-                    self.chat_sessions[role].history.append(temp_chat.history[-2]) # User prompt message object
-                    self.chat_sessions[role].history.append(temp_chat.history[-1]) # Model response message object
+                    self.chat_sessions[role].history.append(temp_chat.history[-2])
+                    self.chat_sessions[role].history.append(temp_chat.history[-1])
                 else:
-                    # Fallback or warning if temp_chat history is not as expected
                     print(f"   ⚠️ Warning: Could not fully transfer history from temp chat for {role}")
-
-
                 opening_statements[f"{role}_opening"] = statement
                 print(f"   ✅ {role.capitalize()} opening statement generated.")
             except Exception as e:
                  print(f"   ❌ ERROR generating {role} opening statement: {e}")
-                 error_msg = f"[Error generating opening statement: {e}]"
+                 if isinstance(e, genai.types.generation_types.BlockedPromptException):
+                      error_msg = f"[Opening Statement Blocked by Safety Filter for {role}]"
+                 else:
+                      error_msg = f"[Error generating opening statement: {e}]"
                  opening_statements[f"{role}_opening"] = error_msg
                  self.debate_history.append({"role": role, "content": error_msg})
 
@@ -430,17 +459,14 @@ class PoliticalDebateSimulator:
 
     def _generate_response(self, role: str, prompt: str, expect_json: bool = False) -> str:
         """Generate a response from the given AI role, optionally expecting JSON."""
+        # (Implementation remains the same)
         if role not in self.chat_sessions:
              raise ValueError(f"Invalid role specified: {role}")
         chat_session = self.chat_sessions[role]
-        # model_instance = self.models[role] # Not needed directly as chat_session uses the correct model
         print(f"   💬 Sending prompt to {role} model {'(expecting JSON)' if expect_json else ''}...")
         for attempt in range(API_RETRY_ATTEMPTS):
              try:
-                 # Send message using the persistent chat session
                  response = chat_session.send_message(prompt)
-
-                 # Check for empty or blocked response (no change needed here)
                  if not response.parts:
                       block_reason = "Unknown (No Parts)"
                       safety_feedback = None
@@ -451,8 +477,6 @@ class PoliticalDebateSimulator:
                       except AttributeError: pass
                       print(f"   ⚠️ Model '{role}' returned empty parts. Reason: {block_reason}")
                       return f"[Model '{role}' response blocked or empty. Reason: {block_reason}]"
-
-                 # Extract text content (no change needed here)
                  response_text = ""
                  try:
                       response_text = response.text
@@ -471,14 +495,17 @@ class PoliticalDebateSimulator:
                  if not response_text and not expect_json:
                      print(f"   ⚠️ Model '{role}' returned response with parts but no extractable text.")
                      return f"[Model '{role}' response contained no extractable text]"
-
                  print(f"   ✅ Response received from {role} model.")
-                 return response_text # History is managed by the chat_session object
-
-             # Exception handling (no change needed here)
+                 return response_text
              except genai.types.generation_types.BlockedPromptException as e:
                   print(f"   ❌ ERROR: Prompt for '{role}' was blocked. {e}")
-                  return f"[Prompt Blocked for '{role}']"
+                  reason = "Unknown"
+                  try:
+                      # Use response.prompt_feedback which is available even on blocked responses
+                      if response and response.prompt_feedback and response.prompt_feedback.block_reason:
+                           reason = response.prompt_feedback.block_reason.name
+                  except AttributeError: pass
+                  return f"[Prompt Blocked for '{role}'. Reason: {reason}]"
              except genai.types.generation_types.StopCandidateException as e:
                   print(f"   ⚠️ Generation for '{role}' stopped unexpectedly. {e}")
                   partial_text = ""
@@ -502,6 +529,7 @@ class PoliticalDebateSimulator:
 
     def _generate_search_queries(self, opponent_role: str, opponent_statement: str) -> List[str]:
         """Ask the current LLM to generate search queries based on the opponent's statement."""
+        # (Implementation remains the same)
         current_role = self.current_turn
         num_queries = self.config.get('num_search_queries', 3)
         print(f"--- 🧠 Asking {current_role.upper()} to generate {num_queries} search queries ---")
@@ -524,23 +552,16 @@ class PoliticalDebateSimulator:
         }}
         """
         try:
-            # Use the main _generate_response method, expecting JSON
             response_text = self._generate_response(current_role, prompt, expect_json=True)
             try:
-                # Clean potential markdown code fences
-                if response_text.strip().startswith("```json"):
-                    response_text = response_text.strip()[7:-3].strip()
-                elif response_text.strip().startswith("```"):
-                     response_text = response_text.strip()[3:-3].strip()
-
+                if response_text.strip().startswith("```json"): response_text = response_text.strip()[7:-3].strip()
+                elif response_text.strip().startswith("```"): response_text = response_text.strip()[3:-3].strip()
                 data = json.loads(response_text)
                 queries = data.get("queries", [])
-
                 if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
-                    # Filter out empty strings just in case
                     queries = [q for q in queries if q.strip()]
                     print(f"   ✅ Generated queries: {queries}")
-                    return queries[:num_queries] # Return the requested number
+                    return queries[:num_queries]
                 else:
                     print("   ⚠️ LLM response was valid JSON but 'queries' key was missing or not a list of strings.")
                     print(f"      Received data: {data}")
@@ -549,7 +570,6 @@ class PoliticalDebateSimulator:
                 print(f"   ⚠️ Failed to decode JSON response from LLM for search queries: {e}")
                 print(f"      Raw response: {response_text}")
                 extracted = re.findall(r'"([^"]+)"', response_text)
-                # Filter out empty strings from regex fallback too
                 extracted = [q for q in extracted if q.strip()]
                 if extracted: print(f"      Attempting fallback extraction: {extracted[:num_queries]}"); return extracted[:num_queries]
                 return []
@@ -559,27 +579,23 @@ class PoliticalDebateSimulator:
 
     def _get_opponent_role(self) -> str:
         """Get the opposing role to the current turn."""
+        # (Implementation remains the same)
         return "conservative" if self.current_turn == "leftist" else "leftist"
 
     def next_turn(self):
         """Advance the debate: generate queries, research them, generate rebuttal."""
+        # (Implementation remains the same - uses updated prompt text below)
         if not self.current_topic or len(self.debate_history) < 2: print("❌ ERROR: Debate topic not set or not enough history for a rebuttal."); return None
         opponent_role = self._get_opponent_role()
         opponent_last_response = None
-        # Find the most recent response from the opponent
         for i in range(len(self.debate_history) - 1, -1, -1):
-             if self.debate_history[i]["role"] == opponent_role:
-                  opponent_last_response = self.debate_history[i]["content"]
-                  break
+             if self.debate_history[i]["role"] == opponent_role: opponent_last_response = self.debate_history[i]["content"]; break
         if not opponent_last_response:
              print(f"   ⚠️ WARNING: Could not find last response from {opponent_role}. Proceeding without research.")
              opponent_last_response = "[Opponent response not found in history]"
              search_queries = []
         else:
-            # Generate search queries based on the opponent's actual last response
             search_queries = self._generate_search_queries(opponent_role, opponent_last_response)
-
-        # Perform research based on generated queries
         aggregated_research_results = {}
         if search_queries:
             print(f"\n--- ⏳ Researching {len(search_queries)} LLM-Generated Queries ---")
@@ -595,8 +611,6 @@ class PoliticalDebateSimulator:
                     aggregated_research_results[query] = {"web": [], "books": []}
             print("--- ✅ Research Complete ---")
         else: print("--- ℹ️ Skipping research phase (no queries generated / opponent response missing) ---")
-
-        # Format research for the rebuttal prompt
         research_text_summary = ""
         if aggregated_research_results:
             research_text_summary += "\n--- RESEARCH FINDINGS (Based on Your Requested Queries) ---\n"
@@ -612,8 +626,9 @@ class PoliticalDebateSimulator:
             research_text_summary += "--- END RESEARCH ---\n"
         else: research_text_summary = "\n(No research was conducted for this turn.)\n"
 
-        # Construct and generate the rebuttal
         print(f"\n{'='*10} 💬 TURN: {self.current_turn.upper()} (Responding to {opponent_role.upper()}) {'='*10}")
+
+        # Rebuttal prompt with updated length/formatting guidance
         prompt = f"""
         DEBATE TOPIC: "{self.current_topic}"
         Your Role: {self.current_turn.capitalize()}
@@ -633,36 +648,154 @@ class PoliticalDebateSimulator:
         4.  Be persuasive, logical, and fact-based.
         5.  **Develop a thorough and well-reasoned response. Aim for a length around 1000-1250 words to fully explore the arguments, but prioritize relevance, clarity, and quality over strict adherence to length. You do not need to use the full word count if a shorter response is more effective.**
         6.  Directly counter or build upon the opponent's points. Avoid simply repeating your opening statement.
+        7.  **Remember to format your response using paragraphs (separated by double newlines) for readability.**
 
         Generate your rebuttal now:
         """
         print(f"--- ⏳ Generating {self.current_turn.upper()} Rebuttal ---")
         response_text = self._generate_response(self.current_turn, prompt, expect_json=False)
-
-        # Add the rebuttal to the main history
         self.debate_history.append({"role": self.current_turn, "content": response_text})
-
-        # Print the rebuttal
         role_emoji = "🔵" if self.current_turn == "leftist" else "🔴"
         print(f"\n--- {role_emoji} {self.current_turn.upper()} RESPONSE ---")
-        # Consider printing only a snippet if responses become very long e.g., print(response_text[:500] + "...")
         print(response_text)
-        print(f"\n({len(response_text.split())} words generated)") # Add word count
+        print(f"\n({len(response_text.split())} words generated)")
         print("="*55)
-
-        # Switch turns for the *next* call to next_turn
         prev_turn = self.current_turn
         self.current_turn = self._get_opponent_role()
-
         return { "role": prev_turn, "content": response_text, "generated_queries": search_queries }
 
+    # ** NEW: Method for Closing Arguments **
+    def generate_closing_argument(self, role: str):
+        """Generates a closing argument for the specified role."""
+        print(f"\n{'='*10} 🎤 Generating Closing Argument for {role.upper()} {'='*10}")
+
+        # Prepare a simple text transcript for the prompt
+        transcript_for_prompt = f"Debate Topic: {self.current_topic}\n\n"
+        for entry in self.debate_history:
+            transcript_for_prompt += f"--- {entry['role'].upper()} ---\n{entry['content']}\n\n"
+
+        # Limit transcript length if it's extremely long (adjust limit as needed)
+        max_transcript_len = 15000 # Example limit, might need tuning
+        if len(transcript_for_prompt) > max_transcript_len:
+            transcript_for_prompt = transcript_for_prompt[:max_transcript_len] + "\n... (Transcript truncated for prompt)"
+
+        prompt = f"""
+        The debate on "{self.current_topic}" has concluded its main rounds.
+        Your Role: {role.capitalize()}
+
+        Below is the transcript of the entire debate so far:
+        --- DEBATE TRANSCRIPT START ---
+        {transcript_for_prompt}
+        --- DEBATE TRANSCRIPT END ---
+
+        Instructions:
+        1.  Review the entire debate transcript provided above.
+        2.  Deliver a powerful closing argument from your political perspective ({role}).
+        3.  Summarize your strongest points made during the debate.
+        4.  Directly address and refute the main arguments or themes presented by your opponent throughout the debate.
+        5.  Conclude with a persuasive final statement reinforcing why your position is superior or more valid.
+        6.  **Aim for a comprehensive closing statement, around 1000-1500 words, but prioritize impact and coherence over length. You do not need to use the full word count.**
+        7.  **Format your response using paragraphs (separated by double newlines) for readability.**
+
+        Generate your closing argument now:
+        """
+        try:
+            # Use a temporary model instance *without* JSON config for closing argument
+            temp_model = genai.GenerativeModel(
+                 model_name=self.config['model_name'],
+                 system_instruction=self.config[f'{role}_prompt'],
+                 safety_settings=self.safety_settings
+            )
+            # Use the *persistent* chat history for context, but generate via temp_model?
+            # Alternative: Use _generate_response with the main chat session directly
+            # Let's use _generate_response with the main chat session for better context handling
+            closing_statement = self._generate_response(role, prompt, expect_json=False)
+
+            self.debate_history.append({"role": role, "content": closing_statement})
+            role_emoji = "🔵" if role == "leftist" else "🔴"
+            print(f"\n--- {role_emoji} {role.upper()} CLOSING ARGUMENT ---")
+            print(closing_statement)
+            print(f"\n({len(closing_statement.split())} words generated)")
+            print("="*55)
+            return closing_statement
+        except Exception as e:
+            print(f"   ❌ ERROR generating {role} closing argument: {e}")
+            error_msg = f"[Error generating closing argument for {role}: {e}]"
+            self.debate_history.append({"role": role, "content": error_msg})
+            return error_msg
+
+    # ** NEW: Method for Judge's Verdict **
+    def generate_judge_verdict(self):
+        """Generates a verdict from the neutral Judge AI."""
+        print(f"\n{'='*10} ⚖️ Generating Judge's Verdict {'='*10}")
+
+        # Prepare the full transcript, including closing arguments
+        full_transcript = f"Debate Topic: {self.current_topic}\n\n"
+        for entry in self.debate_history: # History now includes closing args
+            full_transcript += f"--- {entry['role'].upper()} ---\n{entry['content']}\n\n"
+
+        # Limit transcript length if extremely long (adjust as needed)
+        max_transcript_len = 20000 # Generous limit for judge
+        if len(full_transcript) > max_transcript_len:
+             # Simple truncation, could be smarter (e.g., summarize middle turns)
+             print("   ⚠️ Transcript too long for Judge prompt, truncating...")
+             full_transcript = full_transcript[:max_transcript_len] + "\n... (Full Transcript Truncated)"
+
+
+        prompt = f"""
+        You are the impartial Judge. Below is the full transcript of the political debate on "{self.current_topic}".
+
+        --- FULL DEBATE TRANSCRIPT START ---
+        {full_transcript}
+        --- FULL DEBATE TRANSCRIPT END ---
+
+        Your Task:
+        Evaluate the performance of the Leftist and Conservative participants based *only* on the following criteria:
+        1. Logical Consistency: Were arguments free from contradictions?
+        2. Use of Evidence (within the debate): How well was presented information (research snippets, claims) used?
+        3. Responsiveness & Refutation: Were opponent's points directly addressed and effectively countered?
+        4. Clarity & Structure: Were arguments clear and well-organized?
+
+        Instructions:
+        1. Analyze the transcript based *only* on the criteria above. Do not inject personal opinions about the topic.
+        2. Write a verdict explaining your evaluation.
+        3. Declare which side presented the stronger case *according to the criteria* and provide specific reasons, citing examples from the transcript if possible. Mention key strengths and weaknesses of both sides.
+        4. Maintain a strictly neutral and analytical tone.
+        5. Aim for a verdict of around 500-750 words.
+        6. **Format your verdict using paragraphs for readability.**
+
+        Generate your verdict now:
+        """
+        try:
+            # Use the judge model directly with generate_content
+            response = self.judge_model.generate_content(prompt)
+            verdict = response.text
+
+            # Append verdict to history with a specific role
+            self.debate_history.append({"role": "judge", "content": verdict})
+            print(f"\n--- ⚖️ JUDGE'S VERDICT ---")
+            print(verdict)
+            print("="*55)
+            return verdict
+        except Exception as e:
+            print(f"   ❌ ERROR generating Judge's verdict: {e}")
+            error_msg = f"[Error generating Judge's verdict: {e}]"
+            # Optionally add error to history
+            self.debate_history.append({"role": "judge", "content": error_msg})
+            return error_msg
+
+
     def run_debate(self, turns: int = 3):
-        """Run the debate for a specified number of turns per side."""
+        """Run the debate turns, then closing arguments, then judge's verdict."""
         if not self.current_topic: print("❌ ERROR: Please set a topic first using set_topic()"); return []
         if not isinstance(turns, int) or turns <= 0: print(f"❌ ERROR: Invalid number of turns specified ({turns}). Must be a positive integer."); return []
+
         print(f"\n{'='*15} Starting Debate: {turns} Turns Per Side {'='*15}")
         results = []
         total_responses = turns * 2
+        debate_successful = True # Flag to track if main debate completes
+
+        # --- Main Debate Turns ---
         for i in range(total_responses):
             turn_number = (i // 2) + 1
             expected_role = "leftist" if i % 2 == 0 else "conservative"
@@ -675,23 +808,47 @@ class PoliticalDebateSimulator:
             print(f"\n>>> Starting Debate Turn {turn_number} ({side_display_name} Response {i+1}/{total_responses}) <<<")
 
             turn_result = self.next_turn()
-            if turn_result and "[Model" not in turn_result.get("content","") and "[Prompt Blocked" not in turn_result.get("content",""): # Basic check for error messages
+            # Check for actual content and absence of error markers
+            if turn_result and turn_result.get("content") and \
+               "[Model" not in turn_result["content"] and \
+               "[Prompt Blocked" not in turn_result["content"] and \
+               "[Error generating" not in turn_result["content"]:
                 results.append(turn_result)
             else:
                  print(f"   ⚠️ Turn {turn_number} ({side_display_name}) failed to generate a valid response or was blocked. Stopping debate.")
-                 # Save whatever history exists up to this point
-                 self.save_debate()
+                 debate_successful = False
                  break # Stop if a turn fails or is blocked
 
             if i < total_responses - 1:
                 print(f"\n--- ⏱️ Waiting {self.config['debate_delay']} seconds before next turn ({self.current_turn.upper()}'s response) ---")
                 time.sleep(self.config['debate_delay'])
 
-        print(f"\n{'='*15} Debate Concluded After {len(results)} Responses {'='*15}")
-        return results
+        if debate_successful:
+            print(f"\n{'='*15} Main Debate Rounds Concluded {'='*15}")
+
+            # --- Closing Arguments ---
+            # Determine order (e.g., loser of last turn goes first, or fixed order)
+            # Let's use a fixed order: Leftist then Conservative
+            self.generate_closing_argument("leftist")
+            time.sleep(self.config['debate_delay']) # Pause before next closing arg
+            self.generate_closing_argument("conservative")
+
+            # --- Judge's Verdict ---
+            time.sleep(self.config['debate_delay']) # Pause before verdict
+            self.generate_judge_verdict()
+
+        else:
+            print(f"\n{'='*15} Debate Stopped Early Due To Errors {'='*15}")
+
+
+        # Save final history including closing args and verdict (if generated)
+        self.save_debate()
+        return results # Return results from main debate turns only
+
 
     def save_debate(self, filename: str = None):
         """Save the current debate history and config to a JSON file."""
+        # (Implementation remains the same - saves entire self.debate_history)
         if not self.debate_history: print("   ℹ️ No debate history to save."); return None
         if not filename:
             topic_slug = self.current_topic or "untitled_debate"
@@ -703,14 +860,14 @@ class PoliticalDebateSimulator:
         debate_data = {
             "topic": self.current_topic, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "config_summary": {k: v for k, v in self.config.items() if 'prompt' not in k},
-            "history": self.debate_history, }
+            "history": self.debate_history, } # Includes closing args and verdict now
         try:
-            print(f"\n--- 💾 Saving debate transcript to: {filename} ---")
+            print(f"\n--- 💾 Saving full debate log to: {filename} ---")
             with open(filename, "w", encoding='utf-8') as f: json.dump(debate_data, f, indent=2, ensure_ascii=False)
-            print("--- ✅ Debate saved successfully ---")
+            print("--- ✅ Debate log saved successfully ---")
             return filename
-        except IOError as e: print(f"❌ ERROR saving debate to {filename}: {e}"); return None
-        except Exception as e: print(f"❌ An unexpected error occurred while saving debate: {e}"); return None
+        except IOError as e: print(f"❌ ERROR saving debate log: {e}"); return None
+        except Exception as e: print(f"❌ An unexpected error occurred while saving debate log: {e}"); return None
 
     def get_debate_transcript(self, format_type: str = "text"):
         """Get a formatted transcript of the debate (text, markdown, or basic html)."""
@@ -718,26 +875,28 @@ class PoliticalDebateSimulator:
         print(f"\n--- 📄 Generating {format_type.upper()} transcript ---")
         transcript = ""
         if format_type == "html":
-            # Complete HTML generation
             transcript += "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='UTF-8'>\n"
             transcript += f"<title>Debate: {self.current_topic}</title>\n"
-            transcript += "<style>\n"
+            transcript += "<style>\n" # Basic styles
             transcript += " body { font-family: sans-serif; line-height: 1.6; margin: 20px; max-width: 800px; margin-left: auto; margin-right: auto; padding: 1em;}\n"
             transcript += " h1 { text-align: center; border-bottom: 1px solid #ccc; padding-bottom: 10px; margin-bottom: 20px; }\n"
             transcript += " .turn { margin-bottom: 20px; padding: 15px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); }\n"
             transcript += " .leftist-response { background-color: #eef; border-left: 5px solid #66f; }\n"
             transcript += " .conservative-response { background-color: #fee; border-left: 5px solid #f66; }\n"
+            transcript += " .judge-response { background-color: #efe; border-left: 5px solid #0a0; margin-top: 30px; }\n" # Judge style
             transcript += " h3 { margin-top: 0; margin-bottom: 10px; font-size: 1.1em; }\n"
-            transcript += " p { margin-top: 0; margin-bottom: 0; white-space: pre-wrap; } /* Added pre-wrap for newlines */\n"
+            transcript += " p { margin-top: 0; margin-bottom: 0; white-space: pre-wrap; } \n"
             transcript += " .timestamp { font-size: 0.8em; color: #777; text-align: center; margin-top: 30px; }\n"
             transcript += "</style>\n</head>\n<body>\n"
             transcript += f"<h1>Political Debate: {self.current_topic}</h1>\n\n"
             for entry in self.debate_history:
                 role = entry["role"].capitalize()
-                # Escape HTML characters
                 content = entry["content"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                css_class = "leftist-response" if entry["role"] == "leftist" else "conservative-response"
-                # Use <p> with white-space: pre-wrap for formatting
+                # Assign CSS class based on role
+                if entry["role"] == "leftist": css_class = "leftist-response"
+                elif entry["role"] == "conservative": css_class = "conservative-response"
+                elif entry["role"] == "judge": css_class = "judge-response"
+                else: css_class = "" # Default fallback
                 transcript += f'<div class="turn {css_class}">\n  <h3>{role}</h3>\n  <p>{content}</p>\n</div>\n\n'
             transcript += f"<div class='timestamp'>Transcript generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>\n"
             transcript += "</body>\n</html>"
@@ -747,9 +906,8 @@ class PoliticalDebateSimulator:
             for entry in self.debate_history:
                 role = entry["role"].capitalize()
                 content = entry["content"]
-                # Use Markdown blockquote for better readability
-                content_md = '\n'.join(['> ' + line for line in content.splitlines()])
-                transcript += f"## {role}\n\n{content_md}\n\n---\n\n"
+                # Use heading for role, output content directly for paragraphs
+                transcript += f"## {role}\n\n{content}\n\n---\n\n"
             return transcript
         else: # Plain text
             transcript = f"POLITICAL DEBATE: {self.current_topic}\n" + "=" * (len(self.current_topic)+18) + "\n\n"
@@ -772,9 +930,7 @@ if __name__ == "__main__":
         simulator = PoliticalDebateSimulator()
     except Exception as main_init_error:
          print("\n❌ Critical error during simulator initialization. Exiting.")
-         # Error details should have been printed within __init__
          exit(1)
-
 
     # --- Open-ended topic selection ---
     selected_topic = ""
@@ -790,27 +946,30 @@ if __name__ == "__main__":
     num_turns_per_side = 0
     while num_turns_per_side <= 0:
         try:
-            turns_input = input("Enter number of debate turns per side (e.g., 3 for 6 total responses, default: 3): ").strip()
+            turns_input = input("Enter number of main debate turns per side (e.g., 3 for 6 total rebuttals, default: 3): ").strip()
             if not turns_input: num_turns_per_side = 3; print("   Using default: 3 turns per side.")
             else:
                  num_turns_per_side = int(turns_input)
                  if num_turns_per_side <= 0: print("   Please enter a positive number.")
-                 elif num_turns_per_side > 7: print(f"   Warning: {num_turns_per_side} turns per side may be long/expensive.")
+                 elif num_turns_per_side > 5: print(f"   Warning: {num_turns_per_side} turns per side plus closing args may be very long/expensive.") # Adjusted warning threshold
         except ValueError: print("   Invalid input.")
 
 
-    # --- Run simulation ---
+    # --- Run simulation (includes closing args and verdict) ---
     try:
         simulator.set_topic(selected_topic)
+        # run_debate now handles main turns, closing, and verdict internally
         simulator.run_debate(turns=num_turns_per_side)
     except Exception as run_error:
         print(f"\n❌ An error occurred during the debate simulation: {run_error}")
-        print("   Saving any history generated so far.")
+        print("   Attempting to save any history generated so far...")
+        simulator.save_debate() # Attempt save even on error
 
-    # --- Save and transcript options ---
-    saved_filename = simulator.save_debate()
+    # --- Transcript options (Save happens within run_debate now) ---
+    saved_filename = simulator.save_debate() # Get filename if saved
     if saved_filename and simulator.debate_history:
-        view_choice = input("View debate transcript now? (y/n): ").strip().lower()
+        print("\n--- Transcript Options ---")
+        view_choice = input("View final debate transcript now? (y/n): ").strip().lower()
         if view_choice == 'y':
             format_type = ""
             while format_type not in ["text", "markdown", "html"]:
